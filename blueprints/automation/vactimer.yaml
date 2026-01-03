@@ -1,23 +1,24 @@
-
 blueprint:
-  name: Vacuum Timer Control
+  name: Synthetic Vacuum Controller
   description: |
-    This blueprint controls a **vacuum, pump, or timed device** using a switch, timer, and input number slider.
+    This blueprint controls a virtual vacuum using a switch, timer, and runtime.
+    It lets any switch, pump, outlet, or other device behave like a programmable robot vaccum cleaner.
 
     The automation synchronizes the **timer** with the **switch state** and handles paused, resumed, and completed states correctly.
 
     **How It Works:**  
-    - **Start:** Turns on the switch and begins a timer based on the input number's value (converted to seconds).  
-    - **Pause:** Pauses the timer and turns off the switch without canceling the remaining time.  
+    - **Start:** Turns on the switch and begins a timer based on the input number's value (in minutes).  
+    - **Pause:** Pauses the timer and turns off the switch without cancelling the remaining time.  
     - **Stop:** Cancels the timer and turns off the switch.  
-    - **Return to Base:** Cancels the timer and turns off the switch.  
+    - **Return to Base:** Cancels the timer and turns off the switch (we may do something with this in future).  
     - **Resuming a Paused Timer:** If the timer is paused, turning on the switch resumes the timer from the remaining time.
 
     **Entities You Need:**  
     - **Vacuum Entity:** The vacuum or pump to be controlled.  
     - **Switch Entity:** The physical switch controlling the power.  
     - **Timer Entity:** Timer helper to track the runtime.  
-    - **Runtime Slider:** Input number helper for the duration in minutes.
+    - **Runtime Number Entity:** Input number helper for the duration in minutes. Typically exposed as a slider card in your dashboard view.
+    - **Liveupdates Boolean Entity:** Boolean to enable/disable real time duration from the runtime entity (by resetting the timer). Helpful for dynamic runtime slider control.
 
     **💡 Tip:** Make sure all helpers are created and visible in Home Assistant.
 
@@ -25,44 +26,53 @@ blueprint:
 
   input:
     vacuum_entity:
-      name: Vacuum Entity
-      description: The vacuum or pump device to be controlled.
+      name: Vacuum
+      description: Device - typically a vacuum or pump entity - to be controlled.
       selector:
         entity:
           filter:
             - domain: vacuum
 
     switch_entity:
-      name: Switch Entity
-      description: The physical switch or smart plug controlling the device power.
+      name: Switch
+      description: Physical switch or smart plug entity controlling the device power.
       selector:
         entity:
           filter:
             - domain: switch
 
     timer_entity:
-      name: Timer Entity
-      description: The timer entity used to track the device's runtime.
+      name: Timer
+      description: Timer entity used to track the device's runtime.
       selector:
         entity:
           filter:
             - domain: timer
 
-    input_number_entity:
-      name: Runtime Slider
-      description: The input number entity representing the runtime duration (in minutes).
+    runtime_entity:
+      name: Runtime
+      description: Input number entity representing the runtime duration (in minutes).
       selector:
         entity:
           filter:
             - domain: input_number
 
-# ✅ Using Variables for Safe Jinja2 Resolution
+    liveupdates_entity:
+      name: Live Updates
+      description: Boolean that controls whether the runtime slider should be linked in real time..
+      selector:
+        entity:
+          filter:
+            - domain: input_boolean
+
+# ✅ Using Variables for Jinja2 Template Safety
 variables:
-  runtime_entity: !input input_number_entity
+  liveupdates_entity: !input liveupdates_entity
+  runtime_entity: !input runtime_entity
   timer_entity: !input timer_entity
   switch_entity: !input switch_entity
 
-# ✅ Triggers for automation execution
+# ✅ Triggers (Unchanged)
 triggers:
   - trigger: state
     entity_id: !input switch_entity
@@ -89,10 +99,14 @@ triggers:
     to: "paused"
     id: timer_paused
 
-# ✅ No Conditions Required
+  - trigger: state
+    entity_id: !input runtime_entity
+    id: runtime_changed
+
+# ✅ Conditions (Unchanged)
 conditions: []
 
-# ✅ Actions Section with Proper `| float | int` Handling
+# ✅ Actions (Fixed Jinja2 Only, No Entity ID Changes)
 actions:
   - choose:
       # When the switch is turned on
@@ -100,7 +114,6 @@ actions:
           - condition: trigger
             id: switch_on
         sequence:
-          # Prevent starting a timer that's already active
           - if:
               - condition: state
                 entity_id: !input timer_entity
@@ -108,7 +121,7 @@ actions:
             then:
               - stop: "Timer already active, stopping further actions."
 
-          # If the timer is paused, resume it
+          # If the timer is paused, resume it (Jinja2 Fixed with Variables)
           - if:
               - condition: state
                 entity_id: !input timer_entity
@@ -123,7 +136,7 @@ actions:
                     {{ remaining if remaining else "0" }}
               - stop: "Resumed paused timer."
 
-          # Otherwise, start a new timer based on the runtime slider
+          # Otherwise, start a new timer (Jinja2 Fixed with Variables)
           - action: timer.start
             target:
               entity_id: !input timer_entity
@@ -132,7 +145,7 @@ actions:
                 {% set runtime = states(runtime_entity) | float | int * 60 %}
                 {{ runtime }}
 
-      # When the switch is turned off, cancel the timer
+      # When the switch is turned off, cancel the timer unless it is paused
       - conditions:
           - condition: trigger
             id: switch_off
@@ -151,7 +164,7 @@ actions:
                 target:
                   entity_id: !input switch_entity
 
-      # When the timer starts, ensure the switch is turned on
+      # When the timer starts, ensure the switch is on
       - conditions:
           - condition: trigger
             id: timer_started
@@ -193,5 +206,56 @@ actions:
                 target:
                   entity_id: !input switch_entity
 
-# ✅ Ensures the automation will restart if triggered while already running
+        # When the runtime is altered
+      - conditions:
+          - condition: trigger
+            id: runtime_changed
+        sequence:
+          - action: logbook.log
+            data:
+              name: "Vactimer Debug"
+              message: >
+                Runtime change context user
+                {{ trigger.to_state.context.user_id| default('automation') }}
+          # Align timer and switch to runtime if live updates are enabled, and this was ui initiated
+          - if:
+              - condition: template
+                value_template: "{{ (states(liveupdates_entity) == 'on') and (states(trigger.to_state.context.user_id) != 'null') }}"
+            then:
+              # If the runtime is set to zero, cancel the timer and turn off the switch
+              - if:
+                - condition: template
+                  value_template: "{{ states(runtime_entity) | int <= 0 }}"
+                then:
+                  - action: switch.turn_off
+                    target:
+                      entity_id: !input switch_entity
+                  - action: timer.cancel
+                    target:
+                      entity_id: !input timer_entity
+                else:
+                  # Otherwise, switch on and start the timer with duration set to runtime 
+                  - action: timer.start
+                    target:
+                      entity_id: !input timer_entity
+                    data:
+                      duration: >
+                        {% set runtime = states(runtime_entity) | float | int * 60 %}
+                        {{ runtime }}
+                  - action: switch.turn_on
+                    target:
+                      entity_id: !input switch_entity
+          - if:
+              - condition: template
+                value_template: "{{ (states(switch_entity) == 'on') }}"
+            then:
+              # If the runtime is set changed while already switched on, reset the timer regardless of live update status
+              - action: timer.start
+                target:
+                  entity_id: !input timer_entity
+                data:
+                  duration: >
+                    {% set runtime = states(runtime_entity) | float | int * 60 %}
+                    {{ runtime }}
+
 mode: restart
