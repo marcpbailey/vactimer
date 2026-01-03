@@ -1,0 +1,197 @@
+
+blueprint:
+  name: Vacuum Timer Control
+  description: |
+    This blueprint controls a **vacuum, pump, or timed device** using a switch, timer, and input number slider.
+
+    The automation synchronizes the **timer** with the **switch state** and handles paused, resumed, and completed states correctly.
+
+    **How It Works:**  
+    - **Start:** Turns on the switch and begins a timer based on the input number's value (converted to seconds).  
+    - **Pause:** Pauses the timer and turns off the switch without canceling the remaining time.  
+    - **Stop:** Cancels the timer and turns off the switch.  
+    - **Return to Base:** Cancels the timer and turns off the switch.  
+    - **Resuming a Paused Timer:** If the timer is paused, turning on the switch resumes the timer from the remaining time.
+
+    **Entities You Need:**  
+    - **Vacuum Entity:** The vacuum or pump to be controlled.  
+    - **Switch Entity:** The physical switch controlling the power.  
+    - **Timer Entity:** Timer helper to track the runtime.  
+    - **Runtime Slider:** Input number helper for the duration in minutes.
+
+    **💡 Tip:** Make sure all helpers are created and visible in Home Assistant.
+
+  domain: automation
+
+  input:
+    vacuum_entity:
+      name: Vacuum Entity
+      description: The vacuum or pump device to be controlled.
+      selector:
+        entity:
+          filter:
+            - domain: vacuum
+
+    switch_entity:
+      name: Switch Entity
+      description: The physical switch or smart plug controlling the device power.
+      selector:
+        entity:
+          filter:
+            - domain: switch
+
+    timer_entity:
+      name: Timer Entity
+      description: The timer entity used to track the device's runtime.
+      selector:
+        entity:
+          filter:
+            - domain: timer
+
+    input_number_entity:
+      name: Runtime Slider
+      description: The input number entity representing the runtime duration (in minutes).
+      selector:
+        entity:
+          filter:
+            - domain: input_number
+
+# ✅ Using Variables for Safe Jinja2 Resolution
+variables:
+  runtime_entity: !input input_number_entity
+  timer_entity: !input timer_entity
+  switch_entity: !input switch_entity
+
+# ✅ Triggers for automation execution
+triggers:
+  - trigger: state
+    entity_id: !input switch_entity
+    to: "on"
+    id: switch_on
+
+  - trigger: state
+    entity_id: !input switch_entity
+    to: "off"
+    id: switch_off
+
+  - trigger: state
+    entity_id: !input timer_entity
+    to: "active"
+    id: timer_started
+
+  - trigger: state
+    entity_id: !input timer_entity
+    to: "idle"
+    id: timer_finished
+
+  - trigger: state
+    entity_id: !input timer_entity
+    to: "paused"
+    id: timer_paused
+
+# ✅ No Conditions Required
+conditions: []
+
+# ✅ Actions Section with Proper `| float | int` Handling
+actions:
+  - choose:
+      # When the switch is turned on
+      - conditions:
+          - condition: trigger
+            id: switch_on
+        sequence:
+          # Prevent starting a timer that's already active
+          - if:
+              - condition: state
+                entity_id: !input timer_entity
+                state: active
+            then:
+              - stop: "Timer already active, stopping further actions."
+
+          # If the timer is paused, resume it
+          - if:
+              - condition: state
+                entity_id: !input timer_entity
+                state: paused
+            then:
+              - action: timer.start
+                target:
+                  entity_id: !input timer_entity
+                data:
+                  duration: >
+                    {% set remaining = state_attr(timer_entity, 'remaining') %}
+                    {{ remaining if remaining else "0" }}
+              - stop: "Resumed paused timer."
+
+          # Otherwise, start a new timer based on the runtime slider
+          - action: timer.start
+            target:
+              entity_id: !input timer_entity
+            data:
+              duration: >
+                {% set runtime = states(runtime_entity) | float | int * 60 %}
+                {{ runtime }}
+
+      # When the switch is turned off, cancel the timer
+      - conditions:
+          - condition: trigger
+            id: switch_off
+        sequence:
+          - if:
+              - condition: not
+                conditions:
+                  - condition: state
+                    entity_id: !input timer_entity
+                    state: paused
+            then:
+              - action: timer.cancel
+                target:
+                  entity_id: !input timer_entity
+              - action: switch.turn_off
+                target:
+                  entity_id: !input switch_entity
+
+      # When the timer starts, ensure the switch is turned on
+      - conditions:
+          - condition: trigger
+            id: timer_started
+        sequence:
+          - if:
+              - condition: state
+                entity_id: !input switch_entity
+                state: "off"
+            then:
+              - action: switch.turn_on
+                target:
+                  entity_id: !input switch_entity
+
+      # When the timer finishes, turn off the switch
+      - conditions:
+          - condition: trigger
+            id: timer_finished
+        sequence:
+          - if:
+              - condition: state
+                entity_id: !input switch_entity
+                state: "on"
+            then:
+              - action: switch.turn_off
+                target:
+                  entity_id: !input switch_entity
+
+      # When the timer is paused, turn off the switch but keep the timer paused
+      - conditions:
+          - condition: trigger
+            id: timer_paused
+        sequence:
+          - if:
+              - condition: state
+                entity_id: !input switch_entity
+                state: "on"
+            then:
+              - action: switch.turn_off
+                target:
+                  entity_id: !input switch_entity
+
+# ✅ Ensures the automation will restart if triggered while already running
+mode: restart
